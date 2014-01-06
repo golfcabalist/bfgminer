@@ -89,6 +89,9 @@ struct ICARUS_INFO {
 
 	dclk_change_clock_func_t dclk_change_clock_func;
 	struct dclk_data dclk;
+	
+	int read_size;
+	bool do_estimate_hashrate;
 };
 
 struct icarus_state {
@@ -104,6 +107,6 @@ struct icarus_state {
 };
 
 bool icarus_detect_custom(const char *devpath, struct device_drv *, struct ICARUS_INFO *);
-extern int icarus_gets(unsigned char *, int fd, struct timeval *tv_finish, struct thr_info *, int read_count);
+extern int icarus_gets(unsigned char *, int fd, struct timeval *tv_finish, struct thr_info *, int read_count, int read_size);
 
 #endif
