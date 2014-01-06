@@ -134,7 +134,7 @@ bool use_syslog;
 bool opt_quiet_work_updates;
 bool opt_quiet;
 bool opt_realquiet;
-bool opt_loginput;
+int loginput_size;
 bool opt_compact;
 bool opt_show_procs;
 const int opt_cutofftemp = 95;
@@ -3332,6 +3332,8 @@ void get_statline3(char *buf, size_t bufsz, struct cgpu_info *cgpu, bool for_cur
 	if (!opt_show_procs)
 		cgpu = cgpu->device;
 	
+	dev_runtime = cgpu_runtime(cgpu);
+	
 	double rolling, mhashes;
 	int accepted, rejected, stale;
 	double waccepted;
@@ -3345,8 +3347,7 @@ void get_statline3(char *buf, size_t bufsz, struct cgpu_info *cgpu, bool for_cur
 		struct cgpu_info *slave = cgpu;
 		for (int i = 0; i < cgpu->procs; ++i, (slave = slave->next_proc))
 		{
-			dev_runtime = cgpu_runtime(slave);
-			cgpu_utility(slave);
+			slave->utility = slave->accepted / dev_runtime * 60;
 			slave->utility_diff1 = slave->diff_accepted / dev_runtime * 60;
 			
 			rolling += slave->rolling;
@@ -3816,6 +3817,28 @@ static void print_status(int thr_id)
 }
 
 #ifdef HAVE_CURSES
+static
+bool set_statusy(int maxy)
+{
+	if (loginput_size)
+	{
+		maxy -= loginput_size;
+		if (maxy < 0)
+			maxy = 0;
+	}
+	
+	if (logstart < maxy)
+		maxy = logstart;
+	
+	if (statusy == maxy)
+		return false;
+	
+	statusy = maxy;
+	logcursor = statusy;
+	
+	return true;
+}
+
 /* Check for window resize. Called with curses mutex locked */
 static inline void change_logwinsize(void)
 {
@@ -3826,11 +3849,7 @@ static inline void change_logwinsize(void)
 		return;
 
 	if (y > statusy + 2 && statusy < logstart) {
-		if (y - 2 < logstart)
-			statusy = y - 2;
-		else
-			statusy = logstart;
-		logcursor = statusy;
+		set_statusy(y - 2);
 		mvwin(logwin, logcursor, 0);
 		bfg_wresize(statuswin, statusy, x);
 	}
@@ -3849,18 +3868,16 @@ static void check_winsizes(void)
 	if (curses_active_locked()) {
 		int y, x;
 
-		erase();
 		x = getmaxx(statuswin);
-		if (logstart > LINES - 2)
-			statusy = LINES - 2;
-		else
-			statusy = logstart;
-		logcursor = statusy;
-		bfg_wresize(statuswin, statusy, x);
-		getmaxyx(mainwin, y, x);
-		y -= logcursor;
-		bfg_wresize(logwin, y, x);
-		mvwin(logwin, logcursor, 0);
+		if (set_statusy(LINES - 2))
+		{
+			erase();
+			bfg_wresize(statuswin, statusy, x);
+			getmaxyx(mainwin, y, x);
+			y -= logcursor;
+			bfg_wresize(logwin, y, x);
+			mvwin(logwin, logcursor, 0);
+		}
 		unlock_curses();
 	}
 }
@@ -3927,7 +3944,7 @@ bool _log_curses_only(int prio, const char *datetime, const char *str)
 
 	if (curses_active)
 	{
-		if (!opt_loginput || high_prio) {
+		if (!loginput_size || high_prio) {
 			wlog(" %s %s\n", datetime, str);
 			if (high_prio) {
 				touchwin(logwin);
@@ -6764,15 +6781,22 @@ void zero_stats(void)
 }
 
 #ifdef HAVE_CURSES
+static
+void loginput_mode(const int size)
+{
+	clear_logwin();
+	loginput_size = size;
+	check_winsizes();
+}
+
 static void display_pools(void)
 {
 	struct pool *pool;
 	int selected, i, j;
 	char input;
 
-	opt_loginput = true;
+	loginput_mode(7 + total_pools);
 	immedok(logwin, true);
-	clear_logwin();
 updated:
 	for (j = 0; j < total_pools; j++) {
 		for (i = 0; i < total_pools; i++) {
@@ -6969,11 +6993,10 @@ retry:
         		default:
         			goto updated;
         	}
-	} else
-		clear_logwin();
+	}
 
 	immedok(logwin, false);
-	opt_loginput = false;
+	loginput_mode(0);
 }
 
 static const char *summary_detail_level_str(void)
@@ -6990,8 +7013,8 @@ static void display_options(void)
 	int selected;
 	char input;
 
-	opt_loginput = true;
 	immedok(logwin, true);
+	loginput_mode(12);
 retry:
 	clear_logwin();
 	wlogprint("[N]ormal [C]lear [S]ilent mode (disable all output)\n");
@@ -7090,11 +7113,10 @@ retry:
 	} else if (!strncasecmp(&input, "z", 1)) {
 		zero_stats();
 		goto retry;
-	} else
-		clear_logwin();
+	}
 
 	immedok(logwin, false);
-	opt_loginput = false;
+	loginput_mode(0);
 }
 #endif
 
@@ -7121,9 +7143,8 @@ static void set_options(void)
 	int selected;
 	char input;
 
-	opt_loginput = true;
 	immedok(logwin, true);
-	clear_logwin();
+	loginput_mode(8);
 retry:
 	wlogprint("\n[L]ongpoll: %s\n", want_longpoll ? "On" : "Off");
 	wlogprint("[Q]ueue: %d\n[S]cantime: %d\n[E]xpiry: %d\n[R]etries: %d\n"
@@ -7210,8 +7231,8 @@ retry:
 	} else
 		clear_logwin();
 
+	loginput_mode(0);
 	immedok(logwin, false);
-	opt_loginput = false;
 }
 
 int scan_serial(const char *);
@@ -7237,9 +7258,9 @@ void manage_device(void)
 	struct cgpu_info *cgpu;
 	const struct device_drv *drv;
 	
-	opt_loginput = true;
 	selecting_device = true;
 	immedok(logwin, true);
+	loginput_mode(12);
 	
 devchange:
 	if (unlikely(!total_devices))
@@ -7433,15 +7454,13 @@ key_default:
 
 out:
 	selecting_device = false;
-	clear_logwin();
+	loginput_mode(0);
 	immedok(logwin, false);
-	opt_loginput = false;
 }
 
 void show_help(void)
 {
-	opt_loginput = true;
-	clear_logwin();
+	loginput_mode(10);
 	
 	// NOTE: wlogprint is a macro with a buffer limit
 	_wlogprint(
@@ -7474,8 +7493,7 @@ void show_help(void)
 	logwin_update();
 	getch();
 	
-	clear_logwin();
-	opt_loginput = false;
+	loginput_mode(0);
 }
 
 static void *input_thread(void __maybe_unused *userdata)
@@ -7524,6 +7542,27 @@ static void *input_thread(void __maybe_unused *userdata)
 			++devsummaryYOffset;
 			refresh_devstatus();
 			break;
+		case KEY_NPAGE:
+		{
+			const int visible_lines = logcursor - devcursor;
+			const int invisible_lines = total_lines - visible_lines;
+			if (devsummaryYOffset - visible_lines <= -invisible_lines)
+				devsummaryYOffset = -invisible_lines;
+			else
+				devsummaryYOffset -= visible_lines;
+			refresh_devstatus();
+			break;
+		}
+		case KEY_PPAGE:
+		{
+			const int visible_lines = logcursor - devcursor;
+			if (devsummaryYOffset + visible_lines >= 0)
+				devsummaryYOffset = 0;
+			else
+				devsummaryYOffset += visible_lines;
+			refresh_devstatus();
+			break;
+		}
 #endif
 		}
 		if (opt_realquiet) {
@@ -8160,12 +8199,23 @@ static void *stratum_thread(void *userdata)
 		if (unlikely(!pool->has_stratum))
 			break;
 
-		sock = pool->sock;
-		
 		/* Check to see whether we need to maintain this connection
 		 * indefinitely or just bring it up when we switch to this
 		 * pool */
-		if (sock == INVSOCK || (!sock_full(pool) && !cnx_needed(pool))) {
+		while (true)
+		{
+			sock = pool->sock;
+			
+			if (sock == INVSOCK)
+				applog(LOG_DEBUG, "Pool %u: Invalid socket, suspending",
+				       pool->pool_no);
+			else
+			if (!sock_full(pool) && !cnx_needed(pool))
+				applog(LOG_DEBUG, "Pool %u: Connection not needed, suspending",
+				       pool->pool_no);
+			else
+				break;
+			
 			suspend_stratum(pool);
 			clear_stratum_shares(pool);
 			clear_pool_work(pool);

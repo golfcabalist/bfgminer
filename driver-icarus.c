@@ -65,17 +65,10 @@
 // The serial I/O speed - Linux uses a define 'B115200' in bits/termios.h
 #define ICARUS_IO_SPEED 115200
 
-// The size of a successful nonce read
-#define ICARUS_READ_SIZE 4
-
-// Ensure the sizes are correct for the Serial read
-#if (ICARUS_READ_SIZE != 4)
-#error ICARUS_READ_SIZE must be 4
-#endif
 #define ASSERT1(condition) __maybe_unused static char sizeof_uint32_t_must_be_4[(condition)?1:-1]
 ASSERT1(sizeof(uint32_t) == 4);
 
-#define ICARUS_READ_TIME(baud) ((double)ICARUS_READ_SIZE * (double)8.0 / (double)(baud))
+#define ICARUS_READ_TIME(baud, read_size) ((double)read_size * (double)8.0 / (double)(baud))
 
 // Defined in deciseconds
 // There's no need to have this bigger, since the overhead/latency of extra work
@@ -189,13 +182,13 @@ static void rev(unsigned char *s, size_t l)
 #define ICA_GETS_RESTART 1
 #define ICA_GETS_TIMEOUT 2
 
-int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct thr_info *thr, int read_count)
+int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct thr_info *thr, int read_count, int read_size)
 {
 	ssize_t ret = 0;
 	int rc = 0;
 	int epollfd = -1;
 	int epoll_timeout = ICARUS_READ_FAULT_DECISECONDS * 100;
-	int read_amount = ICARUS_READ_SIZE;
+	int read_amount = read_size;
 	bool first = true;
 
 #ifdef HAVE_EPOLL
@@ -582,7 +575,7 @@ bool icarus_detect_custom(const char *devpath, struct device_drv *api, struct IC
 
 	const char golden_nonce[] = "000187a2";
 
-	unsigned char ob_bin[64], nonce_bin[ICARUS_READ_SIZE];
+	unsigned char ob_bin[64], nonce_bin[info->read_size];
 	char nonce_hex[(sizeof(nonce_bin) * 2) + 1];
 
 	get_options(this_option_offset, info);
@@ -604,7 +597,7 @@ bool icarus_detect_custom(const char *devpath, struct device_drv *api, struct IC
 	cgtime(&tv_start);
 
 	memset(nonce_bin, 0, sizeof(nonce_bin));
-	icarus_gets(nonce_bin, fd, &tv_finish, NULL, 1);
+	icarus_gets(nonce_bin, fd, &tv_finish, NULL, 1, info->read_size);
 
 	icarus_close(fd);
 
@@ -663,6 +656,8 @@ static bool icarus_detect_one(const char *devpath)
 	info->quirk_reopen = 1;
 	info->Hs = ICARUS_REV3_HASH_TIME;
 	info->timing_mode = MODE_DEFAULT;
+	info->read_size = 4;
+	info->do_estimate_hashrate = true;
 
 	if (!icarus_detect_custom(devpath, &icarus_drv, info)) {
 		free(info);
@@ -734,7 +729,7 @@ static bool icarus_init(struct thr_info *thr)
 			"BFG\0\x64\x61\x01\x1a\xc9\x06\xa9\x51\xfb\x9b\x3c\x73";
 		
 		icarus_write(fd, pkt, sizeof(pkt));
-		if (ICA_GETS_OK == icarus_gets((unsigned char*)&res, fd, &tv_finish, NULL, info->read_count))
+		if (ICA_GETS_OK == icarus_gets((unsigned char*)&res, fd, &tv_finish, NULL, info->read_count, info->read_size))
 			res = be32toh(res);
 		else
 			res = 0;
@@ -882,7 +877,7 @@ void handle_identify(struct thr_info * const thr, int ret, const bool was_first_
 				break;
 			
 			// Try to get more nonces (ignoring work restart)
-			ret = icarus_gets((void *)&nonce, fd, &tv_now, NULL, (info->fullnonce - delapsed) * 10);
+			ret = icarus_gets((void *)&nonce, fd, &tv_now, NULL, (info->fullnonce - delapsed) * 10, info->read_size);
 			if (ret == ICA_GETS_OK)
 			{
 				nonce = be32toh(nonce);
@@ -979,7 +974,7 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 			read_count = info->read_count;
 keepwaiting:
 			/* Icarus will return 4 bytes (ICARUS_READ_SIZE) nonces or nothing */
-			ret = icarus_gets((void*)&nonce, fd, &state->tv_workfinish, thr, read_count);
+			ret = icarus_gets((void*)&nonce, fd, &state->tv_workfinish, thr, read_count, info->read_size);
 			switch (ret) {
 				case ICA_GETS_RESTART:
 					// The prepared work is invalid, and the current work is abandoned
@@ -1098,8 +1093,14 @@ keepwaiting:
 		       icarus->proc_repr,
 		       (uint64_t)estimate_hashes,
 		       (int64_t)elapsed.tv_sec, (unsigned long)elapsed.tv_usec);
-
-		hash_count = estimate_hashes;
+		
+		if (info->do_estimate_hashrate) {
+			hash_count = estimate_hashes;
+		} else {
+			//Bitmain AntMiner U1
+			hash_count = 0;
+		}
+		
 		goto out;
 	}
 
@@ -1110,10 +1111,15 @@ keepwaiting:
 	else
 		inc_hw_errors(thr, state->last_work, nonce);
 	icarus_transition_work(state, work);
-
-	hash_count = (nonce & info->nonce_mask);
-	hash_count++;
-	hash_count *= info->fpga_count;
+	
+	if (info->do_estimate_hashrate) {
+		hash_count = (nonce & info->nonce_mask);
+		hash_count++;
+		hash_count *= info->fpga_count;
+	} else {
+		//Bitmain AntMiner U1
+		hash_count = 0xffffffff;
+	}
 
 	applog(LOG_DEBUG, "%"PRIpreprv" nonce = 0x%08x = 0x%08" PRIx64 " hashes (%"PRId64".%06lus)",
 	       icarus->proc_repr,
@@ -1168,7 +1174,7 @@ keepwaiting:
 
 		Ti = (double)(elapsed.tv_sec)
 			+ ((double)(elapsed.tv_usec))/((double)1000000)
-			- ((double)ICARUS_READ_TIME(info->baud));
+			- ((double)ICARUS_READ_TIME(info->baud, info->read_size));
 		Xi = (double)hash_count;
 		history0->sumXiTi += Xi * Ti;
 		history0->sumXi += Xi;
