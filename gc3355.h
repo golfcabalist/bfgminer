@@ -34,6 +34,9 @@ struct gc3355_orb_info
 {
 	uint16_t freq;
 	struct timeval scanhash_time;
+	uint8_t tx_buffer[156];
+	int16_t tx_len;
+	uint8_t rx_buffer[GC3355_READ_SIZE]
 };
 
 #define gc3355_open(path)  serial_open(path, 115200, 1, true)
