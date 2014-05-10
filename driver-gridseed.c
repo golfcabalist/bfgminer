@@ -127,6 +127,15 @@ bool gridseed_lowl_probe(const struct lowlevel_device_info * const info)
  */
 
 static
+bool gridseed_thread_init(struct thr_info *thr)
+{
+
+	timer_set_now(&thr->tv_poll);
+	
+	return true;
+}
+
+static
 bool gridseed_thread_prepare(struct thr_info *thr)
 {
 	thr->cgpu_data = calloc(1, sizeof(*thr->cgpu_data));
@@ -257,23 +266,13 @@ bool gridseed_job_prepare(struct thr_info *thr, struct work *work, __maybe_unuse
 	work->id = 12345678;
 
 	if (opt_scrypt)
-	{
-		gc3355_scrypt_reset(device->device_fd);
 		gc3355_scrypt_prepare_work(info->tx_buffer, work);
-	}
 	else
 		gc3355_sha2_prepare_work(info->tx_buffer, work, true);
 
+	work->blk.nonce = 0xffffffff;
 
 	return true;
-}
-
-static
-void gridseed_submit_nonce(struct thr_info * const thr, const unsigned char buf[GC3355_READ_SIZE], struct work * const work)
-{
-	uint32_t nonce = *(uint32_t *)(buf + 4);
-	nonce = le32toh(nonce);
-	submit_nonce(thr, work, nonce);
 }
 
 static
@@ -282,57 +281,71 @@ void gridseed_job_start(struct thr_info *thr)
 	struct cgpu_info *device = thr->cgpu;
 	struct gc3355_orb_info *info = device->device_data;
 
+
+	if (opt_scrypt)
+	{
+		gc3355_scrypt_reset(device->device_fd);
+	}
+
+
 	// send work
 	if (info->tx_len != gc3355_write(device->device_fd, info->tx_buffer, info->tx_len))
 	{
 		applog(LOG_ERR, "%s: Failed to send work", device->dev_repr);
+		job_start_abort(thr, true);
 		return;
 	}
 
+	mt_job_transition(thr);
+	job_start_complete(thr);
+}
+
+static
+void gridseed_poll(struct thr_info *thr)
+{
+	struct cgpu_info *device = thr->cgpu;
+	struct gc3355_orb_info *info = device->device_data;
+
+	unsigned char buf[GC3355_READ_SIZE];
+	int read = 0;
 	int fd = device->device_fd;
 
-	memset(info->rx_buffer, 0, sizeof(info->rx_buffer));
-
-	while (!thr->work_restart)
+	while (!thr->work_restart && (read = gc3355_read(fd, (char *)buf, GC3355_READ_SIZE)) > 0)
 	{
-		int read = gc3355_read(fd, (char *)info->rx_buffer, GC3355_READ_SIZE);
-		if (read > 0) {
+		if (buf[0] == 0x55)
+		{
+			switch(buf[1]) {
+				case 0xaa:
+					// Queue length result
+					// could watch for watchdog reset here
+					break;
+				case 0x10: // BTC result
+				case 0x20: // LTC result
+				{
+					timer_set_now(&thr->tv_morework);
+					
+					uint32_t nonce = *(uint32_t *)(buf + 4);
+					nonce = le32toh(nonce);
+					submit_nonce(thr, thr->work, nonce);
+
+					break;
+				}
+			}
+		}
+		else
+		{
+			applog(LOG_ERR, "%"PRIpreprv": Unrecognized response", device->proc_repr);
 			break;
 		}
 	}
 
-	if (info->rx_buffer[0] == 0x55)
-	{
-		switch(info->rx_buffer[1])
-		{
-			case 0x10: // BTC result
-			case 0x20: // LTC result
-			{
-				break;
-			}
-		}
-	}
-	else
-	{
-		applog(LOG_ERR, "%"PRIpreprv": Unrecognized response", device->proc_repr);
-	}
-
-	mt_job_transition(thr);
-	// TODO: Delay morework until right before it's needed
-	timer_set_now(&thr->tv_morework);
-	job_start_complete(thr);
+	timer_set_delay_from_now(&thr->tv_poll, 250000);
 }
 
 static
 int64_t gridseed_job_process_results(struct thr_info *thr, struct work *work, bool stopping)
 {
-	struct cgpu_info *device = thr->cgpu;
-	struct gc3355_orb_info *info = device->device_data;
-
-	gridseed_submit_nonce(thr, info->rx_buffer, work);
-
-
-	return 0xbd000000;
+	return 0xffffffff;
 }
 
 /*
@@ -372,6 +385,7 @@ struct device_drv gridseed_drv =
 	
 	// initialize device
 	.thread_prepare = gridseed_thread_prepare,
+	.thread_init = gridseed_thread_init,
 	
 	// specify mining type - async
 	.minerloop = minerloop_async,
@@ -379,6 +393,7 @@ struct device_drv gridseed_drv =
 	// async mining hooks
 	.job_prepare = gridseed_job_prepare,
 	.job_start = gridseed_job_start,
+	.poll = gridseed_poll,
 	.job_process_results = gridseed_job_process_results,
 	
 	// scanhash mining hooks
